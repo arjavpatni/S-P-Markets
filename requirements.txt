@@ -1,0 +1,20 @@
+# LLM & Orchestration
+langgraph>=0.4.0
+langchain-anthropic>=0.3.0
+langchain-core>=0.3.0
+anthropic>=0.45.0
+
+# Data
+yfinance>=0.2.40
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+pandas>=2.2.0
+googlenewsdecoder>=0.1.0
+
+# Models & Validation
+pydantic>=2.6.0
+
+# Utilities
+python-dotenv>=1.0.0
+tenacity>=8.2.0
