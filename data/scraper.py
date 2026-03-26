@@ -1,25 +1,20 @@
 import logging
+import re
 import time
 import random
 from datetime import datetime
 from email.utils import parsedate_to_datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_exponential
-from googlenewsdecoder import new_decoderv1
 
 from models.news import NewsArticle
 
 logger = logging.getLogger(__name__)
 
-# Prioritize Moneycontrol, then broaden to other Indian market sources
-NEWS_QUERIES = [
-    "site:moneycontrol.com stock market",
-    "site:moneycontrol.com nifty sensex",
-    "india stock market nifty sensex economy",
-]
+# Moneycontrol RSS feed for the markets section — no scraping blocks
+MONEYCONTROL_MARKETS_RSS = "https://www.moneycontrol.com/rss/marketreports.xml"
 
 HEADERS = {
     "User-Agent": (
@@ -32,12 +27,60 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
+# Keywords that indicate a headline is relevant to stock/financial markets.
+# Kept broad — covers stocks, sectors, instruments, commodities, macro, etc.
+_RELEVANT_KEYWORDS = re.compile(
+    r"\b("
+    # Indices & exchanges
+    r"nifty|sensex|bse|nse|index|sgx nifty|bank nifty|fin nifty|"
+    # General market terms
+    r"stock|share|market|rally|crash|bull|bear|correction|"
+    r"ipo|fii|dii|mutual fund|etf|smallcap|midcap|largecap|"
+    r"trade|trading|investor|equity|portfolio|"
+    # Price action (catches stock-specific headlines like "X surges 5%")
+    r"surge|surges|plunge|plunges|jump|jumps|drop|drops|"
+    r"rise|rises|fall|falls|gain|gains|slip|slips|"
+    r"soar|soars|tank|tanks|tumble|tumbles|dip|dips|"
+    r"climb|climbs|decline|declines|recover|recovers|"
+    r"hit|hits|high|low|record|"
+    # Corporate actions & financials
+    r"earnings|results|profit|revenue|dividend|bonus|buyback|"
+    r"listing|delist|merger|acquisition|stake|takeover|"
+    r"q[1-4]|quarter|annual|guidance|outlook|forecast|"
+    r"top gainer|top loser|most active|"
+    # Sectors & industries
+    r"sector|pharma|banking|it sector|auto|fmcg|metal|energy|realty|"
+    r"infra|infrastructure|telecom|cement|steel|chemical|textile|"
+    r"defence|defense|ev |electric vehicle|aviation|shipping|"
+    r"hospitality|retail|insurance|nbfc|fintech|"
+    # Instruments & derivatives
+    r"futures|options|derivatives|call|put|expiry|contract|"
+    r"warrant|debenture|"
+    # Commodities & metals
+    r"crude|oil|natural gas|gold|silver|copper|aluminium|aluminum|"
+    r"zinc|nickel|lead|tin|iron ore|steel|platinum|palladium|"
+    r"cotton|sugar|wheat|soybean|commodity|commodities|"
+    # Currencies & bonds
+    r"rupee|dollar|forex|currency|bond|yield|treasury|"
+    # Macro & regulatory
+    r"rbi|sebi|inflation|gdp|rate cut|repo rate|fiscal|monetary|"
+    r"tariff|duty|tax|gst|budget|policy|reform|"
+    # Technical
+    r"support|resistance|breakout|technical|moving average|"
+    r"volume|volatility|vix"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def is_market_relevant(headline: str) -> bool:
+    """Check if a headline is relevant to stock markets based on keywords."""
+    return bool(_RELEVANT_KEYWORDS.search(headline))
+
 
 class MarketNewsScraper:
-    """Fetches Indian market news via Google News RSS, preferring Moneycontrol.
-    Resolves Google News redirect URLs and fetches full article bodies."""
-
-    RSS_URL = "https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+    """Fetches Indian market news from Moneycontrol's markets RSS feed.
+    Filters headlines for market relevance before fetching article bodies."""
 
     def __init__(self):
         self._session = requests.Session()
@@ -56,70 +99,54 @@ class MarketNewsScraper:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
     def get_latest_market_news(self, limit: int = 20) -> list[NewsArticle]:
-        """Fetch top Indian market news, preferring Moneycontrol sources.
+        """Fetch market news from Moneycontrol markets RSS feed.
 
         Steps:
-        1. Fetch RSS feeds (fast, no URL decoding yet)
-        2. Deduplicate and sort (Moneycontrol first, then recency)
-        3. Limit to top N
-        4. Decode Google News URLs concurrently (only for the top N)
+        1. Fetch RSS feed from Moneycontrol markets section
+        2. Filter headlines for stock-market relevance by title
+        3. Return top N relevant articles
         """
-        raw_articles = []
-        seen_titles = set()
+        raw_articles = self._fetch_moneycontrol_rss()
 
-        for query in NEWS_QUERIES:
-            try:
-                articles = self._fetch_rss(query)
-                for article in articles:
-                    if article.headline not in seen_titles:
-                        seen_titles.add(article.headline)
-                        raw_articles.append(article)
-            except Exception as e:
-                logger.warning(f"RSS fetch failed for '{query}': {e}")
-
-        # Sort: Moneycontrol first, then by recency
-        raw_articles.sort(
-            key=lambda a: (
-                0 if "moneycontrol" in a.source.lower() else 1,
-                -(a.timestamp.timestamp() if a.timestamp else 0),
+        # Filter for market-relevant headlines only
+        relevant = [a for a in raw_articles if is_market_relevant(a.headline)]
+        skipped = len(raw_articles) - len(relevant)
+        if skipped:
+            logger.info(
+                f"Filtered out {skipped}/{len(raw_articles)} irrelevant headlines"
             )
-        )
 
-        # Limit BEFORE decoding URLs (decoding is slow)
-        limited = raw_articles[:limit]
-
-        # Decode Google News URLs concurrently
-        logger.info(f"Decoding {len(limited)} article URLs...")
-        self._decode_urls_concurrent(limited)
-
-        mc_count = sum(1 for a in limited if "moneycontrol" in a.source.lower())
-        logger.info(f"Fetched {len(limited)} articles ({mc_count} from Moneycontrol)")
+        limited = relevant[:limit]
+        logger.info(f"Fetched {len(limited)} relevant market articles from Moneycontrol")
         return limited
 
-    def _fetch_rss(self, query: str) -> list[NewsArticle]:
-        """Fetch and parse a Google News RSS feed (no URL decoding here)."""
-        url = self.RSS_URL.format(query=query.replace(" ", "+"))
-        response = requests.get(url, timeout=15)
+    def _fetch_moneycontrol_rss(self) -> list[NewsArticle]:
+        """Fetch and parse the Moneycontrol markets RSS feed."""
+        response = requests.get(
+            MONEYCONTROL_MARKETS_RSS, headers=HEADERS, timeout=15
+        )
         response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "lxml-xml")
         items = soup.find_all("item")
 
         articles = []
+        seen_titles = set()
+
         for item in items:
             title_tag = item.find("title")
             link_tag = item.find("link")
             pub_date_tag = item.find("pubDate")
-            source_tag = item.find("source")
             desc_tag = item.find("description")
 
             headline = title_tag.text.strip() if title_tag else ""
-            if not headline:
+            if not headline or headline in seen_titles:
                 continue
+            seen_titles.add(headline)
 
-            source_name = source_tag.text.strip() if source_tag else ""
-            if source_name and headline.endswith(f" - {source_name}"):
-                headline = headline[: -len(f" - {source_name}")].strip()
+            url = link_tag.text.strip() if link_tag else ""
+            if not url:
+                continue
 
             summary = ""
             if desc_tag:
@@ -133,53 +160,32 @@ class MarketNewsScraper:
                 except Exception:
                     pass
 
-            google_link = link_tag.text.strip() if link_tag else ""
+            articles.append(
+                NewsArticle(
+                    headline=headline,
+                    summary=summary,
+                    url=url,
+                    source="Moneycontrol",
+                    timestamp=timestamp,
+                )
+            )
 
-            articles.append(NewsArticle(
-                headline=headline,
-                summary=summary,
-                url=google_link,  # Will be decoded later
-                source=source_name or "Google News",
-                timestamp=timestamp,
-            ))
-
+        logger.info(f"Parsed {len(articles)} articles from Moneycontrol RSS")
         return articles
 
-    def _decode_urls_concurrent(self, articles: list[NewsArticle]):
-        """Decode Google News redirect URLs concurrently."""
-        def decode_one(article: NewsArticle) -> tuple[NewsArticle, str | None]:
-            if "news.google.com" not in article.url:
-                return article, article.url
-            try:
-                result = new_decoderv1(article.url)
-                if result.get("status"):
-                    return article, result["decoded_url"]
-            except Exception as e:
-                logger.debug(f"URL decode failed for '{article.headline[:40]}': {e}")
-            return article, None
-
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {executor.submit(decode_one, a): a for a in articles}
-            for future in as_completed(futures):
-                article, decoded_url = future.result()
-                if decoded_url:
-                    article.url = decoded_url
-
     def get_article_body(self, url: str) -> str:
-        """Fetch the full article body text from the source URL."""
-        if not url or "news.google.com" in url:
+        """Fetch the full article body text from a Moneycontrol URL."""
+        if not url:
             return ""
 
-        if "moneycontrol.com" in url:
-            self._init_session()
-
+        self._init_session()
         time.sleep(random.uniform(0.3, 1.0))
 
         try:
             response = self._session.get(
                 url,
                 timeout=15,
-                headers={"Referer": "https://www.google.com/"},
+                headers={"Referer": "https://www.moneycontrol.com/"},
             )
             if response.status_code != 200:
                 logger.debug(f"Article fetch returned {response.status_code}: {url}")
@@ -193,23 +199,13 @@ class MarketNewsScraper:
             return ""
 
     def _extract_body(self, soup: BeautifulSoup, url: str) -> str:
-        """Extract article body text using source-specific selectors."""
-        if "moneycontrol.com" in url:
-            selectors = [
-                "div.content_wrapper",
-                "div.arti-flow",
-                "div.article_content",
-                "div.artText",
-            ]
-        else:
-            selectors = [
-                "article",
-                "div.article_content",
-                "div.story-content",
-                "div.content_wrapper",
-                "div#contentdata",
-                "main",
-            ]
+        """Extract article body text from Moneycontrol article page."""
+        selectors = [
+            "div.content_wrapper",
+            "div.arti-flow",
+            "div.article_content",
+            "div.artText",
+        ]
 
         for selector in selectors:
             container = soup.select_one(selector)
